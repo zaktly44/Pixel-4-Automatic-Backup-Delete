@@ -1,7 +1,7 @@
 #!/system/bin/sh
 
 # Configuration
-SOURCE_DIRS="/sdcard/SendAnywhere /sdcard/Download"
+SOURCE_DIRS="/storage/emulated/0/SendAnywhere /storage/emulated/0/Download"
 PHOTOS_DB="/data/data/com.google.android.apps.photos/databases/gphotos0.db"
 MODULE_DIR="/data/adb/modules/gphotos_auto_backup"
 LOG_FILE="$MODULE_DIR/monitor.log"
@@ -11,24 +11,42 @@ SLEEP_INTERVAL=15
 CLEANUP_DELAY=300
 BATCH_SIZE=50
 
-# Use absolute paths for binaries to ensure compatibility with all kernels/ROMs
+# Binary paths
 SQLITE="/system/bin/sqlite3"
 [ ! -f "$SQLITE" ] && SQLITE=$(which sqlite3)
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
+    # Keep log file from growing too large
+    if [ $(wc -l < "$LOG_FILE") -gt 1000 ]; then
+        sed -i '1,500d' "$LOG_FILE"
+    fi
 }
 
 notify() {
     /system/bin/cmd notification post -S bigtext -t "GPhotos Backup" "tag_backup" "$1" >/dev/null 2>&1
 }
 
+# Initial check
+log "--- Monitor Diagnostic Start ---"
+log "Module Dir: $MODULE_DIR"
+log "SQLite binary: $SQLITE"
+log "Photos DB: $PHOTOS_DB (Exists: $([ -f "$PHOTOS_DB" ] && echo "YES" || echo "NO"))"
+for dir in $SOURCE_DIRS; do
+    log "Monitored Dir: $dir (Exists: $([ -d "$dir" ] && echo "YES" || echo "NO"))"
+done
+
 # Ensure state files exist
 touch "$IN_PROGRESS_FILE" "$PENDING_DELETE_FILE"
 
-# Function to escape single quotes for SQL-like where clauses
 escape_sql() {
     echo "$1" | sed "s/'/''/g"
+}
+
+# Force MediaStore scan
+scan_file() {
+    local filepath="$1"
+    /system/bin/am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d "file://$filepath" > /dev/null 2>&1
 }
 
 check_backups_batch() {
@@ -48,7 +66,15 @@ get_content_uri() {
     local filepath="$1"
     local escaped_path=$(escape_sql "$filepath")
     local id=$(/system/bin/content query --uri content://media/external/file --projection _id --where "_data='$escaped_path'" 2>/dev/null | sed -n 's/.*_id=\([0-9]*\).*/\1/p')
-    [ -n "$id" ] && echo "content://media/external/file/$id" || echo "file://$filepath"
+    if [ -n "$id" ]; then
+        echo "content://media/external/file/$id"
+    else
+        log "Warning: Could not find MediaStore ID for $filepath. Forcing scan."
+        scan_file "$filepath"
+        sleep 2
+        id=$(/system/bin/content query --uri content://media/external/file --projection _id --where "_data='$escaped_path'" 2>/dev/null | sed -n 's/.*_id=\([0-9]*\).*/\1/p')
+        [ -n "$id" ] && echo "content://media/external/file/$id" || echo "file://$filepath"
+    fi
 }
 
 trigger_batch_upload() {
@@ -67,16 +93,17 @@ trigger_batch_upload() {
     done < "$files_file"
     uris=${uris%,}
 
-    log "Triggering batch upload for $count files"
-    notify "Uploading $count files to Google Photos..."
+    log "Attempting to trigger batch upload for $count files..."
 
-    /system/bin/am start -n com.google.android.apps.photos/com.google.android.apps.photos.upload.UploadContentActivity \
+    # Try the most robust intent first
+    local out=$(/system/bin/am start -n com.google.android.apps.photos/com.google.android.apps.photos.upload.UploadContentActivity \
              -a android.intent.action.SEND_MULTIPLE \
              --eua android.intent.extra.STREAM "$uris" \
              -t "*/*" \
-             --user 0 > /dev/null 2>&1
+             --user 0 2>&1)
 
-    # Minimize UI to return to home screen
+    log "Intent result: $out"
+
     if /system/bin/dumpsys display | grep -q "mScreenState=ON"; then
         sleep 2
         /system/bin/input keyevent KEYCODE_HOME
@@ -84,21 +111,9 @@ trigger_batch_upload() {
 }
 
 # Main loop
-log "Monitor started on Kirisakura kernel."
+log "Entering main loop."
 
 while true; do
-    # Safety Check: Prevent the script from running if the system is extremely busy or shutting down
-    if [ "$(getprop sys.shutdown.requested)" != "" ]; then
-        log "System shutting down. Exiting monitor."
-        exit 0
-    fi
-
-    # Optimization: If the device is in Power Save mode, double the sleep interval
-    current_sleep=$SLEEP_INTERVAL
-    if [ "$(settings get global low_power)" = "1" ]; then
-        current_sleep=$((SLEEP_INTERVAL * 2))
-    fi
-
     now=$(date +%s)
 
     # 1. Delayed cleanup
@@ -107,7 +122,7 @@ while true; do
         deleted_count=0
         while IFS='|' read -r timestamp file; do
             if [ $((now - timestamp)) -ge $CLEANUP_DELAY ]; then
-                log "Deleting: $file"
+                log "Deleting backed up file: $file"
                 rm -f "$file"
                 deleted_count=$((deleted_count + 1))
             else
@@ -115,10 +130,10 @@ while true; do
             fi
         done < "$PENDING_DELETE_FILE"
         mv "$tmp_pending" "$PENDING_DELETE_FILE"
-        [ $deleted_count -gt 0 ] && notify "Cleanup: Deleted $deleted_count backed-up files."
+        [ $deleted_count -gt 0 ] && notify "Cleanup: Deleted $deleted_count files."
     fi
 
-    # 2. Check in-progress files (Verification)
+    # 2. Verification
     if [ -s "$IN_PROGRESS_FILE" ]; then
         tmp_check=$(mktemp)
         awk -F'|' '{print $2}' "$IN_PROGRESS_FILE" > "$tmp_check"
@@ -126,14 +141,14 @@ while true; do
         backed_up_files=$(mktemp)
         check_backups_batch "$tmp_check" > "$backed_up_files"
 
-        if [ -s "$backed_up_files" ] || grep -q "\|" "$IN_PROGRESS_FILE"; then
+        if [ -s "$backed_up_files" ]; then
             tmp_new_progress=$(mktemp)
             while IFS='|' read -r timestamp file; do
                 if grep -qFx "$file" "$backed_up_files" 2>/dev/null; then
-                    log "Backup confirmed: $file"
+                    log "Confirmed backed up in GPhotos: $file"
                     echo "$(date +%s)|$file" >> "$PENDING_DELETE_FILE"
                 elif [ $((now - timestamp)) -gt 3600 ]; then
-                    log "Timeout: $file"
+                    log "Retrying timed out file: $file"
                 else
                     echo "$timestamp|$file" >> "$tmp_new_progress"
                 fi
@@ -143,18 +158,38 @@ while true; do
         rm -f "$tmp_check" "$backed_up_files"
     fi
 
-    # 3. Discovery of new files
+    # 3. Discovery
     discovery_list=$(mktemp)
+    found_any=0
     for dir in $SOURCE_DIRS; do
-        [ -d "$dir" ] && /system/bin/find "$dir" -maxdepth 1 -type f ! -name ".*" >> "$discovery_list"
+        if [ -d "$dir" ]; then
+            # Find and count files
+            count=$(/system/bin/find "$dir" -maxdepth 1 -type f ! -name ".*" | wc -l)
+            if [ "$count" -gt 0 ]; then
+                log "Found $count total files in $dir"
+                /system/bin/find "$dir" -maxdepth 1 -type f ! -name ".*" >> "$discovery_list"
+                found_any=1
+            fi
+        fi
     done
 
-    if [ -s "$discovery_list" ]; then
+    if [ "$found_any" -eq 1 ]; then
         batch_trigger_file=$(mktemp)
         batch_count=0
 
         while IFS= read -r file; do
-            grep -qF "|$file" "$IN_PROGRESS_FILE" "$PENDING_DELETE_FILE" && continue
+            if grep -qF "|$file" "$IN_PROGRESS_FILE" "$PENDING_DELETE_FILE" 2>/dev/null; then
+                continue
+            fi
+
+            # Additional check: skip if file is being written (size stability)
+            s1=$(stat -c%s "$file")
+            sleep 1
+            s2=$(stat -c%s "$file")
+            if [ "$s1" != "$s2" ]; then
+                log "File still being written: $file"
+                continue
+            fi
 
             echo "$file" >> "$batch_trigger_file"
             batch_count=$((batch_count + 1))
@@ -172,5 +207,5 @@ while true; do
     fi
     rm -f "$discovery_list"
 
-    sleep $current_sleep
+    sleep $SLEEP_INTERVAL
 done
