@@ -1,0 +1,6 @@
+id=gphotos_auto_backup
+name=Google Photos Auto Backup (Root)
+version=v1.0
+versionCode=1
+author=Jules
+description=Automatically backs up files from Send Anywhere and Blip to Google Photos and deletes them after success.
