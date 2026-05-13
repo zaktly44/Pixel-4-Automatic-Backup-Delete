@@ -11,12 +11,16 @@ SLEEP_INTERVAL=15
 CLEANUP_DELAY=300
 BATCH_SIZE=50
 
+# Use absolute paths for binaries to ensure compatibility with all kernels/ROMs
+SQLITE="/system/bin/sqlite3"
+[ ! -f "$SQLITE" ] && SQLITE=$(which sqlite3)
+
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
 }
 
 notify() {
-    cmd notification post -S bigtext -t "GPhotos Backup" "tag_backup" "$1" >/dev/null 2>&1
+    /system/bin/cmd notification post -S bigtext -t "GPhotos Backup" "tag_backup" "$1" >/dev/null 2>&1
 }
 
 # Ensure state files exist
@@ -31,9 +35,10 @@ check_backups_batch() {
     local list_file="$1"
     [ ! -f "$PHOTOS_DB" ] && return
     [ ! -s "$list_file" ] && return
+    [ -z "$SQLITE" ] && return
 
     local results_file=$(mktemp)
-    sqlite3 "$PHOTOS_DB" "SELECT filepath FROM local_media WHERE state IN (3,4) OR remote_url IS NOT NULL OR remote_media_key IS NOT NULL;" > "$results_file" 2>/dev/null
+    "$SQLITE" "$PHOTOS_DB" "SELECT filepath FROM local_media WHERE state IN (3,4) OR remote_url IS NOT NULL OR remote_media_key IS NOT NULL;" > "$results_file" 2>/dev/null
 
     grep -Fxf "$results_file" "$list_file"
     rm -f "$results_file"
@@ -42,7 +47,7 @@ check_backups_batch() {
 get_content_uri() {
     local filepath="$1"
     local escaped_path=$(escape_sql "$filepath")
-    local id=$(content query --uri content://media/external/file --projection _id --where "_data='$escaped_path'" 2>/dev/null | sed -n 's/.*_id=\([0-9]*\).*/\1/p')
+    local id=$(/system/bin/content query --uri content://media/external/file --projection _id --where "_data='$escaped_path'" 2>/dev/null | sed -n 's/.*_id=\([0-9]*\).*/\1/p')
     [ -n "$id" ] && echo "content://media/external/file/$id" || echo "file://$filepath"
 }
 
@@ -65,22 +70,35 @@ trigger_batch_upload() {
     log "Triggering batch upload for $count files"
     notify "Uploading $count files to Google Photos..."
 
-    am start -n com.google.android.apps.photos/com.google.android.apps.photos.upload.UploadContentActivity \
+    /system/bin/am start -n com.google.android.apps.photos/com.google.android.apps.photos.upload.UploadContentActivity \
              -a android.intent.action.SEND_MULTIPLE \
              --eua android.intent.extra.STREAM "$uris" \
              -t "*/*" \
              --user 0 > /dev/null 2>&1
 
-    if dumpsys display | grep -q "mScreenState=ON"; then
+    # Minimize UI to return to home screen
+    if /system/bin/dumpsys display | grep -q "mScreenState=ON"; then
         sleep 2
-        input keyevent KEYCODE_HOME
+        /system/bin/input keyevent KEYCODE_HOME
     fi
 }
 
 # Main loop
-log "Monitor started."
+log "Monitor started on Kirisakura kernel."
 
 while true; do
+    # Safety Check: Prevent the script from running if the system is extremely busy or shutting down
+    if [ "$(getprop sys.shutdown.requested)" != "" ]; then
+        log "System shutting down. Exiting monitor."
+        exit 0
+    fi
+
+    # Optimization: If the device is in Power Save mode, double the sleep interval
+    current_sleep=$SLEEP_INTERVAL
+    if [ "$(settings get global low_power)" = "1" ]; then
+        current_sleep=$((SLEEP_INTERVAL * 2))
+    fi
+
     now=$(date +%s)
 
     # 1. Delayed cleanup
@@ -128,7 +146,7 @@ while true; do
     # 3. Discovery of new files
     discovery_list=$(mktemp)
     for dir in $SOURCE_DIRS; do
-        [ -d "$dir" ] && find "$dir" -maxdepth 1 -type f ! -name ".*" >> "$discovery_list"
+        [ -d "$dir" ] && /system/bin/find "$dir" -maxdepth 1 -type f ! -name ".*" >> "$discovery_list"
     done
 
     if [ -s "$discovery_list" ]; then
@@ -136,7 +154,6 @@ while true; do
         batch_count=0
 
         while IFS= read -r file; do
-            # Robust check for already tracked files
             grep -qF "|$file" "$IN_PROGRESS_FILE" "$PENDING_DELETE_FILE" && continue
 
             echo "$file" >> "$batch_trigger_file"
@@ -155,5 +172,5 @@ while true; do
     fi
     rm -f "$discovery_list"
 
-    sleep $SLEEP_INTERVAL
+    sleep $current_sleep
 done
