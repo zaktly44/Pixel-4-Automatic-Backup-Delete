@@ -17,9 +17,8 @@ SQLITE="/system/bin/sqlite3"
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
-    # Keep log file from growing too large
-    if [ $(wc -l < "$LOG_FILE") -gt 1000 ]; then
-        sed -i '1,500d' "$LOG_FILE"
+    if [ $(wc -l < "$LOG_FILE" 2>/dev/null || echo 0) -gt 2000 ]; then
+        sed -i '1,1000d' "$LOG_FILE"
     fi
 }
 
@@ -27,23 +26,14 @@ notify() {
     /system/bin/cmd notification post -S bigtext -t "GPhotos Backup" "tag_backup" "$1" >/dev/null 2>&1
 }
 
-# Initial check
-log "--- Monitor Diagnostic Start ---"
-log "Module Dir: $MODULE_DIR"
-log "SQLite binary: $SQLITE"
-log "Photos DB: $PHOTOS_DB (Exists: $([ -f "$PHOTOS_DB" ] && echo "YES" || echo "NO"))"
-for dir in $SOURCE_DIRS; do
-    log "Monitored Dir: $dir (Exists: $([ -d "$dir" ] && echo "YES" || echo "NO"))"
-done
-
-# Ensure state files exist
+# Ensure state files exist with correct permissions
 touch "$IN_PROGRESS_FILE" "$PENDING_DELETE_FILE"
+chmod 666 "$IN_PROGRESS_FILE" "$PENDING_DELETE_FILE" "$LOG_FILE" 2>/dev/null
 
 escape_sql() {
     echo "$1" | sed "s/'/''/g"
 }
 
-# Force MediaStore scan
 scan_file() {
     local filepath="$1"
     /system/bin/am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d "file://$filepath" > /dev/null 2>&1
@@ -69,7 +59,7 @@ get_content_uri() {
     if [ -n "$id" ]; then
         echo "content://media/external/file/$id"
     else
-        log "Warning: Could not find MediaStore ID for $filepath. Forcing scan."
+        log "Missing ID for $filepath. Scanning..."
         scan_file "$filepath"
         sleep 2
         id=$(/system/bin/content query --uri content://media/external/file --projection _id --where "_data='$escaped_path'" 2>/dev/null | sed -n 's/.*_id=\([0-9]*\).*/\1/p')
@@ -93,112 +83,105 @@ trigger_batch_upload() {
     done < "$files_file"
     uris=${uris%,}
 
-    log "Attempting to trigger batch upload for $count files..."
+    log "Triggering upload for $count files."
+    notify "Uploading $count files..."
 
-    # Try the most robust intent first
+    # Adding --grant-read-uri-permission for content:// URIs
     local out=$(/system/bin/am start -n com.google.android.apps.photos/com.google.android.apps.photos.upload.UploadContentActivity \
              -a android.intent.action.SEND_MULTIPLE \
              --eua android.intent.extra.STREAM "$uris" \
+             --grant-read-uri-permission \
              -t "*/*" \
              --user 0 2>&1)
 
-    log "Intent result: $out"
+    log "Intent output: $out"
 
-    if /system/bin/dumpsys display | grep -q "mScreenState=ON"; then
+    if [ "$(getprop sys.boot_completed)" = "1" ] && /system/bin/dumpsys display | grep -q "mScreenState=ON"; then
         sleep 2
         /system/bin/input keyevent KEYCODE_HOME
     fi
 }
 
 # Main loop
-log "Entering main loop."
+log "--- Monitor Start (Diagnostic Mode) ---"
 
 while true; do
     now=$(date +%s)
 
-    # 1. Delayed cleanup
+    # 1. Cleanup
     if [ -s "$PENDING_DELETE_FILE" ]; then
         tmp_pending=$(mktemp)
-        deleted_count=0
+        deleted=0
         while IFS='|' read -r timestamp file; do
             if [ $((now - timestamp)) -ge $CLEANUP_DELAY ]; then
-                log "Deleting backed up file: $file"
-                rm -f "$file"
-                deleted_count=$((deleted_count + 1))
+                [ -f "$file" ] && rm -f "$file" && deleted=$((deleted+1))
             else
                 echo "$timestamp|$file" >> "$tmp_pending"
             fi
         done < "$PENDING_DELETE_FILE"
         mv "$tmp_pending" "$PENDING_DELETE_FILE"
-        [ $deleted_count -gt 0 ] && notify "Cleanup: Deleted $deleted_count files."
+        [ $deleted -gt 0 ] && log "Deleted $deleted confirmed files."
     fi
 
     # 2. Verification
     if [ -s "$IN_PROGRESS_FILE" ]; then
         tmp_check=$(mktemp)
         awk -F'|' '{print $2}' "$IN_PROGRESS_FILE" > "$tmp_check"
-
         backed_up_files=$(mktemp)
         check_backups_batch "$tmp_check" > "$backed_up_files"
 
-        if [ -s "$backed_up_files" ]; then
-            tmp_new_progress=$(mktemp)
-            while IFS='|' read -r timestamp file; do
-                if grep -qFx "$file" "$backed_up_files" 2>/dev/null; then
-                    log "Confirmed backed up in GPhotos: $file"
-                    echo "$(date +%s)|$file" >> "$PENDING_DELETE_FILE"
-                elif [ $((now - timestamp)) -gt 3600 ]; then
-                    log "Retrying timed out file: $file"
-                else
-                    echo "$timestamp|$file" >> "$tmp_new_progress"
-                fi
-            done < "$IN_PROGRESS_FILE"
-            mv "$tmp_new_progress" "$IN_PROGRESS_FILE"
-        fi
+        tmp_new_progress=$(mktemp)
+        while IFS='|' read -r timestamp file; do
+            if grep -qFx "$file" "$backed_up_files" 2>/dev/null; then
+                log "Confirmed backup: $file"
+                echo "$(date +%s)|$file" >> "$PENDING_DELETE_FILE"
+            elif [ $((now - timestamp)) -gt 3600 ]; then
+                log "Upload timeout: $file"
+            else
+                echo "$timestamp|$file" >> "$tmp_new_progress"
+            fi
+        done < "$IN_PROGRESS_FILE"
+        mv "$tmp_new_progress" "$IN_PROGRESS_FILE"
         rm -f "$tmp_check" "$backed_up_files"
     fi
 
     # 3. Discovery
+    found_any_in_dirs=0
     discovery_list=$(mktemp)
-    found_any=0
     for dir in $SOURCE_DIRS; do
         if [ -d "$dir" ]; then
-            # Find and count files
-            count=$(/system/bin/find "$dir" -maxdepth 1 -type f ! -name ".*" | wc -l)
-            if [ "$count" -gt 0 ]; then
-                log "Found $count total files in $dir"
-                /system/bin/find "$dir" -maxdepth 1 -type f ! -name ".*" >> "$discovery_list"
-                found_any=1
-            fi
+            /system/bin/find "$dir" -maxdepth 1 -type f ! -name ".*" >> "$discovery_list"
+            found_any_in_dirs=1
         fi
     done
 
-    if [ "$found_any" -eq 1 ]; then
+    if [ "$found_any_in_dirs" -eq 1 ] && [ -s "$discovery_list" ]; then
         batch_trigger_file=$(mktemp)
         batch_count=0
 
         while IFS= read -r file; do
-            if grep -qF "|$file" "$IN_PROGRESS_FILE" "$PENDING_DELETE_FILE" 2>/dev/null; then
-                continue
-            fi
+            # Robust check for already tracked files
+            if ! grep -qF "|$file" "$IN_PROGRESS_FILE" "$PENDING_DELETE_FILE" 2>/dev/null; then
+                log "Discovered new file: $file"
 
-            # Additional check: skip if file is being written (size stability)
-            s1=$(stat -c%s "$file")
-            sleep 1
-            s2=$(stat -c%s "$file")
-            if [ "$s1" != "$s2" ]; then
-                log "File still being written: $file"
-                continue
-            fi
+                s1=$(stat -c%s "$file" 2>/dev/null || echo 0)
+                [ "$s1" -eq 0 ] && continue
+                sleep 1
+                s2=$(stat -c%s "$file" 2>/dev/null || echo 0)
+                if [ "$s1" != "$s2" ]; then
+                    log "Skipping (still writing): $file"
+                    continue
+                fi
 
-            echo "$file" >> "$batch_trigger_file"
-            batch_count=$((batch_count + 1))
+                echo "$file" >> "$batch_trigger_file"
+                batch_count=$((batch_count + 1))
 
-            if [ $batch_count -ge $BATCH_SIZE ]; then
-                trigger_batch_upload "$batch_trigger_file"
-                > "$batch_trigger_file"
-                batch_count=0
-                sleep 2
+                if [ $batch_count -ge $BATCH_SIZE ]; then
+                    trigger_batch_upload "$batch_trigger_file"
+                    > "$batch_trigger_file"
+                    batch_count=0
+                    sleep 2
+                fi
             fi
         done < "$discovery_list"
 
